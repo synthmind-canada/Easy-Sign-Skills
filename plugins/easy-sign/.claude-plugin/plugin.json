@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "easy-sign",
+  "version": "1.0.0",
+  "description": "Send PDFs for signature with an Easy Sign Pro API key, and verify signed documents by Transaction ID.",
+  "author": {
+    "name": "Easy Sign",
+    "url": "https://www.easy-sign.ca"
+  },
+  "homepage": "https://www.easy-sign.ca/docs/api",
+  "repository": "https://github.com/synthmind-canada/Easy-Sign-Skills",
+  "license": "MIT",
+  "keywords": ["e-signature", "pdf", "easy-sign"],
+  "skills": ["./skills/easy-sign-send", "./skills/easy-sign-verify"]
+}

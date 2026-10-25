@@ -1,0 +1,24 @@
+{
+  "sender_timezone": "America/Toronto",
+  "rows": [
+    {
+      "name": "Jane Smith",
+      "email": "jane.smith@example.com",
+      "file": "letters/jane-smith.pdf",
+      "envelope_name": "2026 Engagement Letter - Jane Smith",
+      "fields": [
+        { "type": "signature_date", "page": 1, "position": { "x": 11.8, "y": 70.2, "width": 30, "height": 7 } }
+      ]
+    },
+    {
+      "name": "Sam Lee",
+      "email": "sam.lee@example.com",
+      "file": "letters/sam-lee.pdf",
+      "envelope_name": "2026 Engagement Letter - Sam Lee",
+      "locale": "fr",
+      "fields": [
+        { "type": "signature_date", "page": 1, "position": { "x": 11.8, "y": 70.2, "width": 30, "height": 7 } }
+      ]
+    }
+  ]
+}

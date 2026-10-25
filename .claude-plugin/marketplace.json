@@ -1,0 +1,15 @@
+{
+  "name": "easy-sign",
+  "description": "Official Easy Sign skills: send PDFs for e-signature and verify signed documents from Claude Code.",
+  "owner": {
+    "name": "Easy Sign",
+    "url": "https://www.easy-sign.ca"
+  },
+  "plugins": [
+    {
+      "name": "easy-sign",
+      "source": "./plugins/easy-sign",
+      "description": "Send PDFs for signature with an Easy Sign Pro API key, and verify signed documents by Transaction ID."
+    }
+  ]
+}
