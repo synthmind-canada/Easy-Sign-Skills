@@ -91,7 +91,8 @@ export async function verify({ transactionId, filePath, env, fetchImpl = fetch }
 
 const USAGE = `Usage:
   node easy-sign-verify.mjs <Transaction ID> [signed.pdf]
-  The Transaction ID looks like ES-20261025-1A2B3C4D and is printed on the signed document.
+  The Transaction ID looks like ES-20261025-1A2B3C4D. It is printed on the audit certificate
+  and stored in the signed PDF's properties (pdfinfo shows it as the Subject).
   With a PDF, only its SHA-256 hash is sent; the file stays on this computer.`;
 
 export async function main(argv, env, log = console.log) {

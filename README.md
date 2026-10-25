@@ -73,15 +73,22 @@ Ask in plain words, for example:
 
 For sending, the agent always works the same way:
 
-1. It writes a plan file (`signature-plan.json`) listing who gets which PDF and where they sign.
-2. It checks the plan. This reads your files and sends nothing.
+1. It writes a plan file (for example `2026-10-25-engagement-letters.json`) listing who gets
+   which PDF, where they sign, and your time zone.
+2. It checks the plan. This reads your files, compares them with earlier sends in the same
+   folder, and sends nothing. It also prints a short fingerprint of the plan.
 3. It shows you the plan and waits for your yes. This is the moment to look closely, or to ask
    another agent to review the plan and the PDFs.
-4. It sends, one request at a time, and saves the results next to the plan
-   (`signature-plan.sent.json`).
+4. It sends exactly the plan that was checked: the send command needs the fingerprint `check`
+   printed and refuses if the plan or any local PDF changed since. The results are saved next to
+   the plan (`<plan>.sent.json`).
 
-Every request carries an idempotency key, so retrying after a network error or an interruption
-never emails anyone twice: running the same command again skips what was already sent.
+The script writes down each row before sending it, and every request carries an idempotency
+key. If a send is interrupted, running the same command again skips what was already sent and
+repeats the request that was in progress; Easy Sign recognizes a repeated request for 24 hours,
+so the signer is not emailed twice. When the script cannot tell whether a row went out, it says
+so instead of guessing, and refuses anything that could send it a second time until you have
+checked the dashboard.
 
 You can try the flow on the examples in [`examples/`](examples/). They use fictional
 `@example.com` addresses, so `check` is safe to run, but don't send them.
@@ -94,6 +101,9 @@ You can try the flow on the examples in [`examples/`](examples/). They use ficti
 - `easy-sign-verify` sends only the Transaction ID and the PDF's SHA-256 hash. The file stays
   on your computer.
 - The API key is read from the environment and never written anywhere by these scripts.
+  The results file keeps only a short hash of it, to notice when a different key is used.
+- Plan files and their `.sent.json` results contain your clients' names and email addresses.
+  Keep them out of git and shared folders.
 
 ## Testing against another server
 

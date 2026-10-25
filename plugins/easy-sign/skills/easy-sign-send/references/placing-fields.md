@@ -21,11 +21,12 @@ Presets are only positions: any field type can use any preset.
    installed, list every word with its box:
 
    ```bash
-   pdftotext -bbox-layout -f 2 -l 2 letter.pdf -
+   pdftotext -bbox-layout -cropbox -f 2 -l 2 letter.pdf -
    ```
 
    The output gives the page `width` and `height` in points, and `xMin yMin xMax yMax`
-   for each word, also measured from the top-left.
+   for each word, also measured from the top-left. Keep `-cropbox`: it measures the visible
+   page, as Easy Sign does, which matters for PDFs with trimmed margins.
 
 2. Convert to percent: `x = xMin / width * 100`, `y = yMin / height * 100`.
 
