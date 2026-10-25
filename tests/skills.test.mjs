@@ -71,3 +71,21 @@ test('versions agree across plugin.json and both SKILL.md files', () => {
     assert.match(text, new RegExp(`version: "${manifest.version.replaceAll('.', '\\.')}"`), name);
   }
 });
+
+// skill 文档让 agent 跑 `easy-sign <命令>`：每一条都必须是插件命令认得的，且旁边写着
+// 没有这个命令时（Codex、未经插件安装）该用哪个脚本。命令清单来自 bin/easy-sign 的真实输出
+test('every easy-sign command in the skills is one the plugin command accepts, with a fallback', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const bin = join(PLUGIN, 'bin/easy-sign');
+  const { stdout } = await promisify(execFile)(bin, ['--help'], { encoding: 'utf8' });
+  const accepted = new Set([...stdout.matchAll(/^ {2}easy-sign (\w+)/gm)].map((m) => m[1]));
+  assert.deepEqual([...accepted].sort(), ['check', 'resolve', 'send', 'verify']);
+  for (const name of skillDirs) {
+    const text = readFileSync(join(SKILLS, name, 'SKILL.md'), 'utf8');
+    const used = [...text.matchAll(/^\s*easy-sign (\w+)/gm)].map((m) => m[1]);
+    assert.ok(used.length > 0, `${name} shows no easy-sign command`);
+    for (const command of used) assert.ok(accepted.has(command), `${name}: easy-sign ${command} is not a command`);
+    assert.match(text, /`easy-sign: command not found`/, `${name} must say what to run without the plugin command`);
+  }
+});

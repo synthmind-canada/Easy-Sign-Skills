@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -24,7 +24,8 @@ import {
   readApiKey,
   resolveBaseUrl,
   resultsPathFor,
-  rowIdempotencyKey,
+  legacyRowIdempotencyKey,
+  planIdempotencyKeys,
   runSend,
   validatePlan,
 } from '../plugins/easy-sign/skills/easy-sign-send/scripts/easy-sign-send.mjs';
@@ -32,6 +33,7 @@ import {
 const SCRIPT = fileURLToPath(
   new URL('../plugins/easy-sign/skills/easy-sign-send/scripts/easy-sign-send.mjs', import.meta.url),
 );
+const BIN = fileURLToPath(new URL('../plugins/easy-sign/bin/easy-sign', import.meta.url));
 const API_KEY = 'es_live_testkey_0123456789';
 const OTHER_KEY = 'es_live_otherkey_9876543210';
 const SIGNING_URL = 'https://www.easy-sign.ca/sign/env-1?token=SECRET-SIGNER-TOKEN';
@@ -243,11 +245,11 @@ describe('validatePlan', () => {
   });
 });
 
-describe('rowIdempotencyKey', () => {
-  const base = () => vp([row()]).rows[0];
+describe('planIdempotencyKeys', () => {
+  const keyOf = (rows = [row()], tz = TZ) => planIdempotencyKeys(vp(rows).rows, tz)[0];
 
-  test('is stable for the same plan, row and content', () => {
-    assert.equal(rowIdempotencyKey('abcd1234', base(), 'UTC'), rowIdempotencyKey('abcd1234', base(), 'UTC'));
+  test('is stable for the same content', () => {
+    assert.equal(keyOf(), keyOf());
   });
 
   // 钉死一个字面值：键里混进任何「每次运行都不同」的值（进程号、随机数、时间），这里就红。
@@ -255,19 +257,17 @@ describe('rowIdempotencyKey', () => {
   test('is exactly the documented value for a fixed row', () => {
     writeFileSync(join(dir, 'fixed.pdf'), '%PDF-1.4\n% fixed fixture\n%%EOF\n');
     const fixed = vp([{ name: 'Jane Smith', email: 'Jane@Example.com', file: 'fixed.pdf', envelope_name: 'Letter', fields: [{ type: 'signature_date', page: 1, preset: 'signature_bottom_left' }] }]);
-    assert.equal(rowIdempotencyKey('abcd1234', fixed.rows[0], fixed.senderTimezone), 'es-abcd1234-1-1724e58f7d2dcfa527c5d99b');
+    assert.deepEqual(planIdempotencyKeys(fixed.rows, fixed.senderTimezone), ['es-v2-1724e58f7d2dcfa527c5d99b-1']);
     assert.equal(planFingerprint(fixed.rows, fixed.senderTimezone), '260c8eca79a3');
   });
 
   test('ignores email case', () => {
-    const upper = vp([row({ email: 'Jane@Example.com' })]).rows[0];
-    assert.equal(rowIdempotencyKey('p', base(), 'UTC'), rowIdempotencyKey('p', upper, 'UTC'));
+    assert.equal(keyOf(), keyOf([row({ email: 'Jane@Example.com' })]));
   });
 
-  test('changes with the plan id, the time zone and every part of the row', () => {
-    const key = rowIdempotencyKey('p', base(), 'UTC');
-    assert.notEqual(key, rowIdempotencyKey('q', base(), 'UTC'));
-    assert.notEqual(key, rowIdempotencyKey('p', base(), TZ));
+  test('changes with the time zone and every part of the row', () => {
+    const key = keyOf();
+    assert.notEqual(key, keyOf([row()], 'UTC'));
     const variants = [
       { email: 'other@example.com' },
       { name: 'Jane Q Smith' },
@@ -277,16 +277,55 @@ describe('rowIdempotencyKey', () => {
       { fields: [{ type: 'signature', page: 1, preset: 'signature_bottom_left' }] },
     ];
     for (const overrides of variants) {
-      assert.notEqual(key, rowIdempotencyKey('p', vp([row(overrides)]).rows[0], 'UTC'), JSON.stringify(overrides));
+      assert.notEqual(key, keyOf([row(overrides)]), JSON.stringify(overrides));
     }
     // 同名文件内容变了（换了一份 PDF）也必须是新键。row() 会重写 jane.pdf，所以先取行再改文件
     const sameRow = row();
     writeFileSync(join(dir, 'jane.pdf'), '%PDF-1.4\n% corrected\n');
-    assert.notEqual(key, rowIdempotencyKey('p', vp([sameRow]).rows[0], 'UTC'));
+    assert.notEqual(key, keyOf([sameRow]));
+  });
+
+  // F1（2026-10-25 完成测试）：键曾含一个只存在结果文件里的随机计划 id，结果文件一丢，同一行就换键、
+  // 服务端认不出、每人再收一封。键现在只看这一行发出去的内容
+  test('does not depend on the row position, the plan file or its folder', () => {
+    const alone = keyOf([row()]);
+    const second = planIdempotencyKeys(vp([row({ email: 'sam@example.com', file: pdf('sam.pdf') }), row()]).rows, TZ)[1];
+    assert.equal(second, alone);
+    const elsewhere = mkdtempSync(join(tmpdir(), 'easy-sign-elsewhere-'));
+    try {
+      writeFileSync(join(elsewhere, 'jane.pdf'), readFileSync(join(dir, 'jane.pdf')));
+      const moved = validatePlan({ sender_timezone: TZ, rows: [{ ...row(), file: 'jane.pdf' }] }, elsewhere);
+      assert.equal(planIdempotencyKeys(moved.rows, TZ)[0], alone);
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  test('gives identical rows in one plan their own keys, numbered in order', () => {
+    const keys = planIdempotencyKeys(vp([row(), row({ email: 'sam@example.com', file: pdf('sam.pdf') }), row()]).rows, TZ);
+    assert.equal(keys[0], keyOf());
+    assert.equal(keys[2], keys[0].replace(/-1$/, '-2'));
+    assert.equal(new Set(keys).size, 3);
+  });
+
+  // 次序号只按「整行内容」计，不按收件人或文档计：同一个人收两份文档、结果文件丢了、计划又调了顺序，
+  // 两行仍必须是原来那两把键（按收件人计数时第二份变成 -2，一调序两把键全变 ⇒ 两份都再发一遍）
+  test('numbers only fully identical rows: one signer with two documents keeps both keys after a reorder', () => {
+    const a = row();
+    const b = row({ file: pdf('jane-b.pdf'), envelope_name: 'Second letter - Jane Smith' });
+    const keys = planIdempotencyKeys(vp([a, b]).rows, TZ);
+    assert.ok(keys.every((k) => k.endsWith('-1')), keys.join(' '));
+    assert.deepEqual(planIdempotencyKeys(vp([b, a]).rows, TZ), [keys[1], keys[0]]);
   });
 
   test('stays far under the 255-character server limit', () => {
-    assert.ok(rowIdempotencyKey('abcd1234', base(), 'America/Argentina/ComodRivadavia').length < 64);
+    assert.ok(keyOf([row()], 'America/Argentina/ComodRivadavia').length < 64);
+  });
+
+  test('the 1.0.0 key shape is still recognized: same content hash behind the plan id and row number', () => {
+    const legacy = legacyRowIdempotencyKey('abcd1234', vp([row()]).rows[0], TZ);
+    assert.match(legacy, /^es-abcd1234-1-[0-9a-f]{24}$/);
+    assert.equal(legacy.slice(-24), keyOf().split('-')[2]);
   });
 });
 
@@ -441,7 +480,7 @@ describe('runSend: sending', () => {
     for (const call of fake.calls) {
       assert.equal(call.url, `${DEFAULT_BASE_URL}/api/agent/sign-request`);
       assert.equal(call.headers.Authorization, `Bearer ${API_KEY}`);
-      assert.match(call.headers['Idempotency-Key'], /^es-[0-9a-f]{8}-\d+-[0-9a-f]{24}$/);
+      assert.match(call.headers['Idempotency-Key'], /^es-v2-[0-9a-f]{24}-\d+$/);
       assert.equal(call.body.sender_timezone, TZ);
     }
     assert.notEqual(fake.keys()[0], fake.keys()[1]);
@@ -594,6 +633,41 @@ describe('runSend: rows that may have been sent', () => {
     const second = fakeFetch([response(201, sentBody(), { 'idempotent-replay': 'true' })]);
     assert.equal((await send(plan, second.impl)).code, 0);
     assert.equal(second.keys()[0], first.keys()[0]);
+  });
+
+  // 1.0.0 写下的结果文件：键是「计划 id + 行号 + 哈希」。可能已发出的一行必须原样重试那把旧键
+  test('a row from a 1.0.0 results file that may have been sent is retried with its original key', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const oldKey = legacyRowIdempotencyKey('abcd1234', vp([row()]).rows[0], TZ);
+    const now = new Date().toISOString();
+    writeFileSync(resultsPathFor(plan), JSON.stringify({
+      plan_id: 'abcd1234',
+      base_url: DEFAULT_BASE_URL,
+      rows: [{ row: 1, email: 'jane@example.com', document: vp([row()]).rows[0].document.id, idempotency_key: oldKey, api_key_fp: apiKeyFingerprint(API_KEY), first_attempt_at: now, at: now, status: 'unknown' }],
+    }));
+    const fake = fakeFetch([response(201, sentBody(), { 'idempotent-replay': 'true' })]);
+    const { code, text } = await send(plan, fake.impl);
+    assert.equal(code, 0, text);
+    assert.deepEqual(fake.keys(), [oldKey]);
+    assert.match(text, /already sent by an earlier run \(no new email\)/);
+    assert.equal(readResults(plan).rows[0].idempotency_key, oldKey);
+  });
+
+  test('a row a 1.0.0 run already sent is skipped, not reported as changed', async () => {
+    const plan = writePlan({ rows: [row(), row({ email: 'sam@example.com', name: 'Sam Lee', file: pdf('sam.pdf') })] });
+    const first = vp([row()]).rows[0];
+    writeFileSync(resultsPathFor(plan), JSON.stringify({
+      plan_id: 'abcd1234',
+      base_url: DEFAULT_BASE_URL,
+      rows: [{ row: 1, email: 'jane@example.com', document: first.document.id, idempotency_key: legacyRowIdempotencyKey('abcd1234', first, TZ), status: 'sent', envelope_id: 'env-old' }],
+    }));
+    const fake = fakeFetch([response(201, sentBody(2))]);
+    const { code, text } = await send(plan, fake.impl);
+    assert.equal(code, 0, text);
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0].body.recipient.email, 'sam@example.com');
+    assert.match(fake.keys()[0], /^es-v2-[0-9a-f]{24}-1$/);
+    assert.match(text, /Summary: 1 sent now, 1 already sent before/);
   });
 
   test('a persistent 409 ends as "may have been sent", never as not sent', async () => {
@@ -937,6 +1011,65 @@ describe('command line', () => {
     } finally {
       server.close();
     }
+  });
+
+  // F1 的回归：第一次发完，把结果文件删掉（换了文件夹 / 电脑也一样），再跑一次。
+  // 两个独立进程必须带出同一把键，服务端才认得是同一个请求、不再发第二封
+  test('the same row sends the same key even after its results file is gone', async () => {
+    const seen = [];
+    const server = createServer((req, res) => {
+      seen.push(req.headers['idempotency-key']);
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(201, { 'content-type': 'application/json', ...(seen.length > 1 ? { 'idempotent-replay': 'true' } : {}) });
+        res.end(JSON.stringify(sentBody()));
+      });
+    });
+    await new Promise((done) => server.listen(0, '127.0.0.1', done));
+    try {
+      const env = { ...process.env, EASY_SIGN_API_KEY: API_KEY, EASY_SIGN_BASE_URL: `http://127.0.0.1:${server.address().port}` };
+      const plan = writePlan({ rows: [row()] });
+      const run = (args) => promisify(execFile)(process.execPath, [SCRIPT, ...args], { env, encoding: 'utf8' }).catch((e) => e);
+      const fingerprint = (await run(['check', plan])).stdout.match(/Plan fingerprint: ([0-9a-f]{12})/)?.[1];
+      assert.ok(fingerprint);
+      const first = await run(['send', plan, '--approve', fingerprint]);
+      assert.equal(first.code ?? 0, 0, first.stdout);
+      rmSync(resultsPathFor(plan));
+      const second = await run(['send', plan, '--approve', fingerprint]);
+      assert.equal(second.code ?? 0, 0, second.stdout);
+      assert.equal(seen.length, 2);
+      assert.equal(seen[1], seen[0]);
+      assert.match(second.stdout, /already sent by an earlier run \(no new email\)/);
+    } finally {
+      server.close();
+    }
+  });
+
+  test('the plugin command runs check and verify, and prints the combined usage', async () => {
+    const run = (args) => promisify(execFile)(BIN, args, { env: { ...process.env, ...ENV }, encoding: 'utf8' }).catch((e) => e);
+    assert.ok((statSync(BIN).mode & 0o111) !== 0, 'bin/easy-sign must be executable');
+    const help = await run(['--help']);
+    assert.equal(help.code ?? 0, 0);
+    assert.match(help.stdout, /easy-sign check <plan\.json>/);
+    assert.match(help.stdout, /easy-sign verify <Transaction ID>/);
+    assert.equal((await run([])).code, 2);
+    const example = fileURLToPath(new URL('../examples/signature-plan.json', import.meta.url));
+    const checked = await run(['check', example]);
+    assert.equal(checked.code ?? 0, 0, checked.stdout);
+    assert.match(checked.stdout, /Plan fingerprint: [0-9a-f]{12}/);
+    const badId = await run(['verify', 'not-an-id']);
+    assert.equal(badId.code, 2);
+    assert.match(badId.stdout, /is not a Transaction ID/);
+    const usage = await run(['send']);
+    assert.equal(usage.code, 2);
+    assert.match(usage.stdout, /easy-sign send <plan\.json> --approve/);
+  });
+
+  test('the plugin command works through a symlink, as on a PATH', async () => {
+    const link = join(dir, 'easy-sign');
+    symlinkSync(BIN, link);
+    const { stdout } = await promisify(execFile)(link, ['--help'], { encoding: 'utf8' });
+    assert.match(stdout, /easy-sign check/);
   });
 });
 

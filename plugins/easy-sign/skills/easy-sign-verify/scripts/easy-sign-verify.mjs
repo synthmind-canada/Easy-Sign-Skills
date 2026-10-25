@@ -89,16 +89,17 @@ export async function verify({ transactionId, filePath, env, fetchImpl = fetch }
   return { ok: true, http_status: response.status, result: json };
 }
 
-const USAGE = `Usage:
-  node easy-sign-verify.mjs <Transaction ID> [signed.pdf]
+// prog = 用户实际敲的那条命令：插件的 bin/easy-sign 传 'easy-sign verify'
+export const usage = (prog = 'node easy-sign-verify.mjs') => `Usage:
+  ${prog} <Transaction ID> [signed.pdf]
   The Transaction ID looks like ES-20261025-1A2B3C4D. It is printed on the audit certificate
   and stored in the signed PDF's properties (pdfinfo shows it as the Subject).
   With a PDF, only its SHA-256 hash is sent; the file stays on this computer.`;
 
-export async function main(argv, env, log = console.log) {
+export async function main(argv, env, log = console.log, { prog } = {}) {
   const [rawId, filePath, ...rest] = argv;
   if (!rawId || rawId === '--help' || rawId === '-h' || rest.length > 0) {
-    log(USAGE);
+    log(usage(prog));
     return rawId === '--help' || rawId === '-h' ? 0 : 2;
   }
   const transactionId = normalizeTransactionId(rawId);

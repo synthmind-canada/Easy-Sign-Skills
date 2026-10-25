@@ -318,19 +318,39 @@ function rowContent(row) {
   };
 }
 
-/**
- * 一行在本次计划里的 Idempotency-Key：计划 id + 行号 + 这一行全部内容的哈希。
- * 同一份计划重跑（重试）⇒ 键不变 ⇒ 服务端在 24 小时内回放、不重复发信；
- * 改了这一行的任何内容或换了计划 id ⇒ 新键 ⇒ 是一次新的发送。只由计划内容决定，
- * 不许混进任何「每次运行都不同」的值（进程号、随机数、当前时间）。
- */
-export function rowIdempotencyKey(planId, row, senderTimezone) {
+/** 一行发出去的全部内容的哈希：去重键的主体。邮箱不分大小写；文档按字节哈希（url 行按链接）。 */
+function rowContentHash(row, senderTimezone) {
   const content = JSON.stringify({
     ...rowContent(row),
     email: row.email.toLowerCase(),
     sender_timezone: senderTimezone,
   });
-  return `es-${planId}-${row.index + 1}-${sha256(content).slice(0, 24)}`;
+  return sha256(content).slice(0, 24);
+}
+
+/**
+ * 整份计划每一行的 Idempotency-Key，与 rows 一一对应。键只由这一行发出去的内容决定：
+ * 不含计划 id、行号、文件路径，也不许混进任何「每次运行都不同」的值（进程号、随机数、时间）。
+ * 所以结果文件丢了、计划换了文件名或文件夹、换了一台电脑，同样内容的一行仍是同一个键，
+ * 服务端在 24 小时内回放、不重复发信；改了这一行的任何内容（含 PDF 的一个字节）⇒ 新键。
+ * 同一份计划里内容完全相同的几行按出现次序编号，各是一次发送（check 已就此警告）。
+ */
+export function planIdempotencyKeys(rows, senderTimezone) {
+  const seen = new Map();
+  return rows.map((row) => {
+    const hash = rowContentHash(row, senderTimezone);
+    const occurrence = (seen.get(hash) ?? 0) + 1;
+    seen.set(hash, occurrence);
+    return `es-v2-${hash}-${occurrence}`;
+  });
+}
+
+/**
+ * 1.0.0 的键形状（随机计划 id + 行号 + 同一个哈希）。只用来认出 1.0.0 写下的结果记录：
+ * 那时「可能已发出」的一行必须原样重试旧键，服务端才认得是同一个请求。
+ */
+export function legacyRowIdempotencyKey(planId, row, senderTimezone) {
+  return `es-${planId}-${row.index + 1}-${rowContentHash(row, senderTimezone)}`;
 }
 
 /**
@@ -566,7 +586,7 @@ function isAlive(pid) {
 
 /**
  * 结果文件的锁：同一份计划同时跑两个 send，会各自拿着旧的内存副本互相覆盖记录（丢掉的
- * 「已发出」过了 24 小时就会再发一封），两个同时开始的首跑甚至会拿到两个 plan_id。
+ * 「已发出」过了 24 小时就会再发一封）。
  * 锁里记 pid 与主机名：同一台机器上持有者已经不在了（进程被杀）就接手，否则拒绝。
  * 返回释放函数；拿不到锁返回 null。
  */
@@ -766,16 +786,25 @@ async function sendRows({ planPath, result, resultsPath, baseUrl, apiKey, keyFin
     log(`Not sent: ${basename(resultsPath)} records sends to ${previous.base_url}, not ${baseUrl}. Start a new plan file for a different server.`);
     return 1;
   }
+  // plan_id 只标识这个结果文件，不进去重键（见 planIdempotencyKeys）
   const results = previous ?? { plan_id: randomUUID().slice(0, 8), base_url: baseUrl, rows: [] };
 
   // 发任何请求之前先把整份计划过一遍：要拒就整份拒，不发一半再停
-  const keys = result.rows.map((row) => rowIdempotencyKey(results.plan_id, row, result.senderTimezone));
+  const planKeys = planIdempotencyKeys(result.rows, result.senderTimezone);
+  const keys = new Map(result.rows.map((row, i) => [row.index, planKeys[i]]));
+  for (const row of result.rows) {
+    const earlier = results.rows.find((r) => r.row === row.index + 1);
+    // 1.0.0 写下的记录：内容没变就沿用当时的键，否则「可能已发出」的那一行重试时服务端认不出
+    if (earlier && earlier.idempotency_key === legacyRowIdempotencyKey(results.plan_id, row, result.senderTimezone)) {
+      keys.set(row.index, earlier.idempotency_key);
+    }
+  }
   const cutoff = now().getTime() - UNRESOLVED_RETRY_HOURS * 3600 * 1000;
   for (const row of result.rows) {
     const n = row.index + 1;
     const earlier = results.rows.find((r) => r.row === n);
     if (!earlier) continue;
-    const changed = earlier.idempotency_key !== keys[row.index];
+    const changed = earlier.idempotency_key !== keys.get(row.index);
     if (earlier.status === 'sent' && changed) {
       log(`Not sent: row ${n} was already sent${earlier.envelope_id ? ` (envelope ${earlier.envelope_id})` : ''} and has changed since. Put it back as it was. To send a corrected version on purpose, write a new plan file with just that row.`);
       return 1;
@@ -795,8 +824,7 @@ async function sendRows({ planPath, result, resultsPath, baseUrl, apiKey, keyFin
       return 1;
     }
   }
-  // 先落盘 plan_id 再发第一个请求：请求到了服务端而进程在写盘前崩掉时，重跑必须拿回同一个
-  // plan_id（⇒ 同一个键 ⇒ 服务端回放），否则换了新键就是第二封信
+  // 结果文件在第一个请求之前就落盘：之后每一行的 pending 记录都写进它
   if (!previous) saveResults(resultsPath, results);
 
   const where = baseUrl === DEFAULT_BASE_URL ? '' : ` to ${baseUrl}`;
@@ -807,7 +835,7 @@ async function sendRows({ planPath, result, resultsPath, baseUrl, apiKey, keyFin
   const counts = { sentNow: 0, sentBefore: 0, notSent: 0, maybeSent: 0 };
   for (const row of result.rows) {
     const n = row.index + 1;
-    const key = keys[row.index];
+    const key = keys.get(row.index);
     const who = row.name ? `${row.name} <${row.email}>` : `<${row.email}>`;
     const label = `  ${n}/${result.rows.length} ${who}`;
     const earlier = results.rows.find((r) => r.row === n);
@@ -919,12 +947,13 @@ function resolveRow({ resultsPath, row, verdict, log, now }) {
   return 0;
 }
 
-const USAGE = `Usage:
-  node easy-sign-send.mjs check <plan.json>
+// prog = 用户实际敲的那条命令：插件的 bin/easy-sign 传 'easy-sign'，直接跑脚本时是 node 那一串
+export const usage = (prog = 'node easy-sign-send.mjs') => `Usage:
+  ${prog} check <plan.json>
       validate the plan and print its fingerprint; sends nothing
-  node easy-sign-send.mjs send <plan.json> --approve <fingerprint>
+  ${prog} send <plan.json> --approve <fingerprint>
       send every row, only after the user approved this exact plan
-  node easy-sign-send.mjs resolve <plan.json> --row <n> --sent|--not-sent
+  ${prog} resolve <plan.json> --row <n> --sent|--not-sent
       record what the user found in the Easy Sign dashboard for an uncertain row`;
 
 function parseOptions(rest, allowed) {
@@ -945,21 +974,21 @@ function parseOptions(rest, allowed) {
   return { options };
 }
 
-export async function main(argv, env, log = console.log) {
+export async function main(argv, env, log = console.log, { prog } = {}) {
   const [command, planArg, ...rest] = argv;
   if (!command || command === '--help' || command === '-h') {
-    log(USAGE);
+    log(usage(prog));
     return command ? 0 : 2;
   }
   const allowed = { check: {}, send: { '--approve': 'value' }, resolve: { '--row': 'value', '--sent': 'flag', '--not-sent': 'flag' } };
   if (!planArg || !(command in allowed)) {
-    log(USAGE);
+    log(usage(prog));
     return 2;
   }
   const { options, error } = parseOptions(rest, allowed[command]);
   if (error) {
     log(error);
-    log(USAGE);
+    log(usage(prog));
     return 2;
   }
   const planPath = resolve(planArg);

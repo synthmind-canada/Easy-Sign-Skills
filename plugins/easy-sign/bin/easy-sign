@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+// Easy Sign 插件的命令入口。Claude Code 在插件启用时把插件根目录的 bin/ 放进 Bash 的 PATH，
+// 所以 skill 里写 `easy-sign check <plan>` 就够了，不用拼插件缓存里带版本号的长路径。
+// 只做分派，逻辑全在两个 skill 的脚本里（Codex 等没有插件 bin/ 的环境直接用 node 跑那两个脚本）。
+// 写成 CommonJS + 动态 import：没有扩展名的文件在较早的 Node 20 里不会被当成 ES 模块。
+'use strict';
+
+const { join } = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+const SKILLS = join(__dirname, '..', 'skills');
+const SEND = pathToFileURL(join(SKILLS, 'easy-sign-send', 'scripts', 'easy-sign-send.mjs')).href;
+const VERIFY = pathToFileURL(join(SKILLS, 'easy-sign-verify', 'scripts', 'easy-sign-verify.mjs')).href;
+const SEND_COMMANDS = ['check', 'send', 'resolve'];
+
+async function run(argv) {
+  const [command, ...rest] = argv;
+  if (command === 'verify') {
+    const verify = await import(VERIFY);
+    return verify.main(rest, process.env, console.log, { prog: 'easy-sign verify' });
+  }
+  if (SEND_COMMANDS.includes(command)) {
+    const send = await import(SEND);
+    return send.main(argv, process.env, console.log, { prog: 'easy-sign' });
+  }
+  const [send, verify] = await Promise.all([import(SEND), import(VERIFY)]);
+  console.log(send.usage('easy-sign'));
+  console.log(verify.usage('easy-sign verify').replace(/^Usage:\n/, ''));
+  return command === '--help' || command === '-h' || command === 'help' ? 0 : 2;
+}
+
+run(process.argv.slice(2)).then(
+  (code) => {
+    process.exitCode = code;
+  },
+  (error) => {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+  },
+);

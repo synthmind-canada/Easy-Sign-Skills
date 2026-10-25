@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Node.js 20 or later and network access to www.easy-sign.ca.
 metadata:
   author: Easy Sign
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Verify a document signed with Easy Sign
@@ -15,11 +15,16 @@ metadata:
    on the page: run `pdfinfo signed.pdf` (Poppler) and look for
    `Subject: Easy Sign Transaction: ES-...`. If you cannot find it, ask the user.
 
-2. Run the check. The script is in this skill's folder: `scripts/easy-sign-verify.mjs`.
+2. Run the check:
 
    ```bash
-   node <this skill's folder>/scripts/easy-sign-verify.mjs ES-20261025-1A2B3C4D signed.pdf
+   easy-sign verify ES-20261025-1A2B3C4D signed.pdf
    ```
+
+   The Easy Sign plugin puts the `easy-sign` command on the path. If the shell answers
+   `easy-sign: command not found` (in Codex, or when this skill was installed without the
+   plugin), run `node <this skill's folder>/scripts/easy-sign-verify.mjs` in its place, with
+   the same arguments after `verify`.
 
    Pass the PDF whenever the user has it: without it, the check shows only that the record
    exists, not that their file is the signed copy. Only the file's SHA-256 hash is sent to

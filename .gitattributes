@@ -2,3 +2,4 @@
 *.mjs text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+plugins/easy-sign/bin/* text eol=lf

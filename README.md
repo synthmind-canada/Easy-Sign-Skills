@@ -18,15 +18,21 @@ They need Node.js 20 or later.
 In Claude Code:
 
 ```
-/plugin marketplace add synthmind-canada/Easy-Sign-Skills
-/plugin install easy-sign@easy-sign
+/plugin install easy-sign --marketplace synthmind-canada/Easy-Sign-Skills
 ```
 
-Then run `/reload-plugins` or start a new session. To update later, run
-`claude plugin update easy-sign@easy-sign` in a terminal.
+This adds the Easy Sign marketplace and installs the plugin in one step (Claude Code 2.1.275 or
+later). From a terminal, the same is
+`claude plugin install easy-sign --marketplace synthmind-canada/Easy-Sign-Skills` (2.1.292 or
+later). On older versions, run `/plugin marketplace add synthmind-canada/Easy-Sign-Skills` and then
+`/plugin install easy-sign@easy-sign`. If the skills don't show up, run `/reload-plugins`.
+To update later, run `claude plugin update easy-sign@easy-sign` in a terminal.
 
 You can then just ask for what you want; the skills are also available as
-`/easy-sign:easy-sign-send` and `/easy-sign:easy-sign-verify`.
+`/easy-sign:easy-sign-send` and `/easy-sign:easy-sign-verify`. The plugin also gives the agent
+an `easy-sign` command (`easy-sign check`, `easy-sign send`, `easy-sign verify`), so you see
+short commands instead of long script paths. Because it ships that command, claude.ai and
+Cowork don't install this plugin; use Claude Code or Codex.
 
 ### Codex
 
@@ -84,11 +90,12 @@ For sending, the agent always works the same way:
    the plan (`<plan>.sent.json`).
 
 The script writes down each row before sending it, and every request carries an idempotency
-key. If a send is interrupted, running the same command again skips what was already sent and
-repeats the request that was in progress; Easy Sign recognizes a repeated request for 24 hours,
-so the signer is not emailed twice. When the script cannot tell whether a row went out, it says
-so instead of guessing, and refuses anything that could send it a second time until you have
-checked the dashboard.
+key made from everything that row sends (signer, PDF, fields, envelope name, time zone). If a
+send is interrupted, running the same command again skips what was already sent and repeats the
+request that was in progress; Easy Sign recognizes a repeated request for 24 hours, so the signer
+is not emailed twice, even if the results file was lost, as long as the row is unchanged. When
+the script cannot tell whether a row went out, it says so instead of guessing, and refuses
+anything that could send it a second time until you have checked the dashboard.
 
 You can try the flow on the examples in [`examples/`](examples/). They use fictional
 `@example.com` addresses, so `check` is safe to run, but don't send them.

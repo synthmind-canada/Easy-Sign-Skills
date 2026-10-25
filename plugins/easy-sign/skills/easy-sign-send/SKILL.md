@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Node.js 20 or later and network access to www.easy-sign.ca.
 metadata:
   author: Easy Sign
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Send PDFs for signature with Easy Sign
@@ -18,8 +18,10 @@ One request = one PDF + one signer. To send different PDFs to different people (
 PDF to several people, each signing their own copy), put one row per signer in the plan.
 For one PDF that several people must sign together, tell the user to use the Easy Sign web app instead.
 
-The script is in this skill's folder: `scripts/easy-sign-send.mjs`. Run it with
-`node <this skill's folder>/scripts/easy-sign-send.mjs`.
+Run the commands below as written: the Easy Sign plugin puts the `easy-sign` command on the
+path. If the shell answers `easy-sign: command not found` (in Codex, or when this skill was
+installed without the plugin), run `node <this skill's folder>/scripts/easy-sign-send.mjs`
+in its place, with the same arguments.
 
 ## 1. Write the plan
 
@@ -81,7 +83,7 @@ Plan files and their results hold clients' names and emails. Keep them out of gi
 ## 2. Check the plan
 
 ```bash
-node <this skill's folder>/scripts/easy-sign-send.mjs check <plan>.json
+easy-sign check <plan>.json
 ```
 
 `check` reads the files, validates every row, and compares the plan with the results of
@@ -129,7 +131,7 @@ and report what you find. Never run `send` or `resolve`, and never edit the plan
 ## 4. Send
 
 ```bash
-node <this skill's folder>/scripts/easy-sign-send.mjs send <plan>.json --approve <fingerprint>
+easy-sign send <plan>.json --approve <fingerprint>
 ```
 
 - The API key is read from the environment variable `EASY_SIGN_API_KEY`. Never print it,
@@ -137,7 +139,10 @@ node <this skill's folder>/scripts/easy-sign-send.mjs send <plan>.json --approve
 - Rows go out one at a time. Before each request the script writes the row to
   `<plan>.sent.json`, then records the answer. When Easy Sign is busy or rate-limited
   (10 requests a minute), it waits and repeats the same request. Easy Sign recognizes a
-  repeated request for 24 hours and does not email the signer again.
+  repeated request for 24 hours and does not email the signer again. It goes by everything
+  the row sends (signer, PDF, fields, envelope name, time zone), so this holds even if the plan
+  file is moved or its results are lost, as long as the row itself is unchanged; the script
+  then reports the row as already sent before.
 - A long list takes several minutes. Give the command a long timeout (in Claude Code,
   10 minutes) or run it in the background. If it is cut off, run the same command again:
   it skips the rows already sent and repeats the one that was in progress. Run one send
@@ -157,7 +162,9 @@ is turned off. Ask the user to allow it; in Codex that is `network_access = true
 
 ## 5. Report back
 
-The script's summary line counts every row in one of these states. Report each row:
+The script's summary line counts every row in one of these states. Report each row.
+Say a request was sent (emailed), not that the person received it: Easy Sign only knows
+that its email service accepted the message.
 
 | State | What it means |
 |---|---|
@@ -183,8 +190,8 @@ API key is in use), or keeps ending with no clear answer, ask the user to look i
 dashboard for an envelope to that signer, then record what they found:
 
 ```bash
-node <this skill's folder>/scripts/easy-sign-send.mjs resolve <plan>.json --row 4 --sent      # the envelope is there
-node <this skill's folder>/scripts/easy-sign-send.mjs resolve <plan>.json --row 4 --not-sent  # there is none
+easy-sign resolve <plan>.json --row 4 --sent      # the envelope is there
+easy-sign resolve <plan>.json --row 4 --not-sent  # there is none
 ```
 
 Run `resolve` only with the user's answer. After `--not-sent`, the next `send` sends that row

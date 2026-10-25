@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "easy-sign",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Send PDFs for signature with an Easy Sign Pro API key, and verify signed documents by Transaction ID.",
   "author": {
     "name": "Easy Sign",
