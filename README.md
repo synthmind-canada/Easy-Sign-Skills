@@ -45,6 +45,10 @@ codex plugin add easy-sign@easy-sign
 
 Codex runs the same scripts with `node`; the skills tell it how.
 
+To update later, run `codex plugin marketplace upgrade easy-sign`, then start Codex again.
+It fetches the latest version and replaces the installed one; you don't need to add the plugin
+again.
+
 If your Codex doesn't recognize `plugin`, update it, or link the skills by hand
 (see "Without the plugin system" below).
 
