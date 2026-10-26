@@ -1,7 +1,8 @@
 # Easy Sign Skills
 
-Official [Agent Skills](https://agentskills.io) for [Easy Sign](https://www.easy-sign.ca),
-for Claude Code and Codex.
+Official [Agent Skills](https://agentskills.io) for [Easy Sign](https://www.easy-sign.ca).
+Claude Code and Codex can each do the whole job on their own: write a plan, check it, ask you,
+send, and report back.
 
 | Skill | What it does | Needs |
 |---|---|---|
@@ -15,28 +16,42 @@ They need Node.js 20 or later.
 
 ### Claude Code
 
-In Claude Code:
+In a terminal:
 
+```bash
+claude plugin install easy-sign --marketplace synthmind-canada/Easy-Sign-Skills
 ```
-/plugin install easy-sign --marketplace synthmind-canada/Easy-Sign-Skills
-```
 
-This adds the Easy Sign marketplace and installs the plugin in one step (Claude Code 2.1.275 or
-later). From a terminal, the same is
-`claude plugin install easy-sign --marketplace synthmind-canada/Easy-Sign-Skills` (2.1.292 or
-later). On older versions, run `/plugin marketplace add synthmind-canada/Easy-Sign-Skills` and then
-`/plugin install easy-sign@easy-sign`. If the skills don't show up, run `/reload-plugins`.
-To update later, run `claude plugin update easy-sign@easy-sign` in a terminal.
+This adds the Easy Sign marketplace and installs the plugin in one step (Claude Code 2.1.292 or
+later). Inside a Claude Code session, the same is
+`/plugin install easy-sign --marketplace synthmind-canada/Easy-Sign-Skills` (2.1.275 or later).
+On older versions, run `/plugin marketplace add synthmind-canada/Easy-Sign-Skills` and then
+`/plugin install easy-sign@easy-sign`. If the skills don't show up in a session that was already
+open, run `/reload-plugins`. To update later, run `claude plugin update easy-sign@easy-sign`.
 
-You can then just ask for what you want; the skills are also available as
-`/easy-sign:easy-sign-send` and `/easy-sign:easy-sign-verify`. The plugin also gives the agent
-an `easy-sign` command (`easy-sign check`, `easy-sign send`, `easy-sign verify`), so you see
-short commands instead of long script paths. Because it ships that command, claude.ai and
-Cowork don't install this plugin; use Claude Code or Codex.
+The skills are also available as `/easy-sign:easy-sign-send` and `/easy-sign:easy-sign-verify`.
+The plugin gives Claude an `easy-sign` command (`easy-sign check`, `easy-sign send`,
+`easy-sign verify`), so you see short commands instead of long script paths. Because it ships
+that command, claude.ai and Cowork don't install this plugin; use Claude Code or Codex.
 
 ### Codex
 
-Clone the repository once, then link the skills into your Codex skills folder:
+In a terminal:
+
+```bash
+codex plugin marketplace add synthmind-canada/Easy-Sign-Skills
+codex plugin add easy-sign@easy-sign
+```
+
+Codex runs the same scripts with `node`; the skills tell it how.
+
+If your Codex doesn't recognize `plugin`, update it, or link the skills by hand
+(see "Without the plugin system" below).
+
+### Without the plugin system
+
+The skills are plain folders. Clone the repository once and link them into your agent's
+skills folder (`~/.agents/skills/` for Codex, `~/.claude/skills/` for Claude Code):
 
 ```bash
 git clone https://github.com/synthmind-canada/Easy-Sign-Skills.git ~/Easy-Sign-Skills
@@ -45,18 +60,8 @@ ln -s ~/Easy-Sign-Skills/plugins/easy-sign/skills/easy-sign-send ~/.agents/skill
 ln -s ~/Easy-Sign-Skills/plugins/easy-sign/skills/easy-sign-verify ~/.agents/skills/easy-sign-verify
 ```
 
-Update later with `git -C ~/Easy-Sign-Skills pull`.
-
-Codex runs commands in a sandbox without network access by default. To let the skills reach
-Easy Sign, add this to `~/.codex/config.toml` and restart Codex:
-
-```toml
-[sandbox_workspace_write]
-network_access = true
-```
-
-The same links work for Claude Code without the plugin system: link the two folders into
-`~/.claude/skills/` instead.
+For Claude Code, link the same two folders into `~/.claude/skills/` instead. Update later with
+`git -C ~/Easy-Sign-Skills pull`.
 
 ## Set your API key
 
@@ -71,7 +76,8 @@ The same links work for Claude Code without the plugin system: link the two fold
 
 ## Use
 
-Ask in plain words, for example:
+Go to the folder with your PDFs, start Claude Code (`claude`) or Codex (`codex`), and ask in
+plain words, for example:
 
 > Send each client in clients.csv their engagement letter from the letters folder to sign on page 2.
 
@@ -83,8 +89,7 @@ For sending, the agent always works the same way:
    which PDF, where they sign, and your time zone.
 2. It checks the plan. This reads your files, compares them with earlier sends in the same
    folder, and sends nothing. It also prints a short fingerprint of the plan.
-3. It shows you the plan and waits for your yes. This is the moment to look closely, or to ask
-   another agent to review the plan and the PDFs.
+3. It shows you the plan and waits for your yes in the chat. This is the moment to look closely.
 4. It sends exactly the plan that was checked: the send command needs the fingerprint `check`
    printed and refuses if the plan or any local PDF changed since. The results are saved next to
    the plan (`<plan>.sent.json`).
@@ -95,10 +100,30 @@ send is interrupted, running the same command again skips what was already sent 
 request that was in progress; Easy Sign recognizes a repeated request for 24 hours, so the signer
 is not emailed twice, even if the results file was lost, as long as the row is unchanged. When
 the script cannot tell whether a row went out, it says so instead of guessing, and refuses
-anything that could send it a second time until you have checked the dashboard.
+anything that could send it a second time until you have checked the dashboard. When it cannot
+connect to Easy Sign at all, it stops at once instead of retrying.
 
 You can try the flow on the examples in [`examples/`](examples/). They use fictional
 `@example.com` addresses, so `check` is safe to run, but don't send them.
+
+### Network access in Codex
+
+Codex runs commands in a sandbox without network access. Checking a plan doesn't need the
+network. When it is time to send (or to verify a document), Codex asks to run that one command
+outside the sandbox. Choose **Yes, proceed** when it is the send you just approved in the chat
+(the command ends with the plan's fingerprint) or the document check you asked for. That prompt only lets the command run; your yes
+to the plan is the one you give in the chat.
+
+If you run Codex without approval prompts, it cannot ask. Let it write in your folder and
+reach the network in `~/.codex/config.toml`, then start Codex again. This applies to every Codex
+session, not just Easy Sign. Put the first line above any `[section]` in that file:
+
+```toml
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+```
 
 ## Privacy
 

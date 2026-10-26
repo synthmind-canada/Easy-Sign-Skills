@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -11,8 +12,13 @@ import {
   interpret,
   main,
   normalizeTransactionId,
+  PRE_CONNECT_CODES,
+  PRE_CONNECT_SYSCALLS,
+  preConnectFailureCode,
   verify,
 } from '../plugins/easy-sign/skills/easy-sign-verify/scripts/easy-sign-verify.mjs';
+import * as send from '../plugins/easy-sign/skills/easy-sign-send/scripts/easy-sign-send.mjs';
+import { CONNECTED, PRE_CONNECT } from './network-errors.mjs';
 
 const dir = mkdtempSync(join(tmpdir(), 'easy-sign-verify-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -76,10 +82,63 @@ describe('verify', () => {
     assert.match(offline.message, /Could not reach Easy Sign/);
   });
 
+  // 不对称的一对：连不上才说「这台电脑 / 沙箱到不了」，连上之后断开的照旧
+  test('a failed connection says this computer or sandbox cannot reach Easy Sign', async () => {
+    for (const [label, make, code] of PRE_CONNECT) {
+      const outcome = await verify({
+        transactionId: ID,
+        env: {},
+        fetchImpl: async () => {
+          throw make();
+        },
+      });
+      assert.equal(outcome.ok, false);
+      assert.match(outcome.message, new RegExp(`\\(${code}\\)`), label);
+      assert.match(outcome.message, /this computer or sandbox cannot reach it/, label);
+      assert.match(outcome.message, /Codex/, label);
+      assert.match(outcome.message, /run the same command again outside the sandbox after the user approves/, label);
+    }
+    for (const [label, make] of CONNECTED) {
+      const outcome = await verify({
+        transactionId: ID,
+        env: {},
+        fetchImpl: async () => {
+          throw make();
+        },
+      });
+      assert.match(outcome.message, /^Could not reach Easy Sign: /, label);
+      assert.equal(/sandbox/.test(outcome.message), false, label);
+    }
+  });
+
+  test('a real check against a closed port on this computer says it cannot reach Easy Sign', async () => {
+    const server = createServer();
+    await new Promise((done) => server.listen(0, '127.0.0.1', done));
+    const { port } = server.address();
+    await new Promise((done) => server.close(done));
+    const outcome = await verify({ transactionId: ID, env: { EASY_SIGN_BASE_URL: `http://127.0.0.1:${port}` } });
+    assert.match(outcome.message, /Could not connect to Easy Sign \(ECONNREFUSED\)/);
+    assert.match(outcome.message, /outside the sandbox/);
+  });
+
   test('passes a 404 not_found answer through', async () => {
     const outcome = await verify({ transactionId: ID, env: {}, fetchImpl: capture(404, { status: 'not_found', verificationType: 'transaction_only' }).impl });
     assert.equal(outcome.ok, true);
     assert.equal(outcome.result.status, 'not_found');
+  });
+});
+
+// 与 easy-sign-send.mjs 的同名函数同一份判据（两个 skill 各抄一份）：同一组真实形状两边都要答对
+describe('preConnectFailureCode', () => {
+  test('recognizes every failure before connecting, by its code', () => {
+    for (const [label, make, code] of PRE_CONNECT) assert.equal(preConnectFailureCode(make()), code, label);
+  });
+  test('recognizes nothing that happened after connecting, or that it cannot read', () => {
+    for (const [label, make] of CONNECTED) assert.equal(preConnectFailureCode(make()), null, label);
+  });
+  test('uses exactly the same codes and steps as easy-sign-send', () => {
+    assert.deepEqual([...PRE_CONNECT_CODES].sort(), [...send.PRE_CONNECT_CODES].sort());
+    assert.deepEqual([...PRE_CONNECT_SYSCALLS].sort(), [...send.PRE_CONNECT_SYSCALLS].sort());
   });
 });
 

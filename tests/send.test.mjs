@@ -26,9 +26,11 @@ import {
   resultsPathFor,
   legacyRowIdempotencyKey,
   planIdempotencyKeys,
+  preConnectFailureCode,
   runSend,
   validatePlan,
 } from '../plugins/easy-sign/skills/easy-sign-send/scripts/easy-sign-send.mjs';
+import { CONNECTED, PRE_CONNECT } from './network-errors.mjs';
 
 const SCRIPT = fileURLToPath(
   new URL('../plugins/easy-sign/skills/easy-sign-send/scripts/easy-sign-send.mjs', import.meta.url),
@@ -375,7 +377,13 @@ describe('classifyAttempt', () => {
     ['401 database error', r(401, { error: { code: 'DATABASE_ERROR' } }), 'retry', false],
     ['500', r(500, { error: { code: 'INTERNAL_ERROR' } }), 'retry', true],
     ['502 html', r(502, null), 'retry', true],
+    // 503 只有带着去重闸的码才是「什么都没写」；同一个状态码别的样子照旧可能已发出
+    ['503 IDEMPOTENCY_UNAVAILABLE', r(503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE' } }, 5), 'retry', false],
+    ['503 without a code', r(503, null), 'retry', true],
+    ['503 with another code', r(503, { error: { code: 'SERVICE_UNAVAILABLE' } }), 'retry', true],
+    ['500 IDEMPOTENCY_UNAVAILABLE', r(500, { error: { code: 'IDEMPOTENCY_UNAVAILABLE' } }), 'retry', true],
     ['network', { kind: 'network', message: 'ECONNRESET' }, 'retry', true],
+    ['could not connect', { kind: 'unreachable', code: 'ENOTFOUND' }, 'fail'],
     ['500 EMAIL_FAILED', r(500, { error: { code: 'EMAIL_FAILED' } }), 'fail'],
     ['401 bad key', r(401, { error: { code: 'INVALID_API_KEY' } }), 'fail'],
     ['403 pro', r(403, { error: { code: 'PRO_REQUIRED' } }), 'fail'],
@@ -396,9 +404,79 @@ describe('classifyAttempt', () => {
     assert.equal(classifyAttempt(r(429, null), 1).delaySeconds, 60);
   });
 
+  test('503 IDEMPOTENCY_UNAVAILABLE waits Retry-After, capped, and backs off without it', () => {
+    const unavailable = (retryAfter) => r(503, { error: { code: 'IDEMPOTENCY_UNAVAILABLE' } }, retryAfter);
+    assert.equal(classifyAttempt(unavailable(5), 3).delaySeconds, 5);
+    assert.equal(classifyAttempt(unavailable(9999), 1).delaySeconds, 120);
+    assert.equal(classifyAttempt(unavailable(0), 1).delaySeconds, 5);
+    assert.equal(classifyAttempt(unavailable(), 2).delaySeconds, 10);
+  });
+
   test('a failed attempt reports the server code, or the HTTP status', () => {
     assert.equal(classifyAttempt(r(400, { error: { code: 'INVALID_EMAIL' } }), 1).code, 'INVALID_EMAIL');
     assert.equal(classifyAttempt(r(413, null), 1).code, 'HTTP_413');
+  });
+
+  test('a failed connection is NETWORK_UNAVAILABLE and keeps the raw code', () => {
+    const verdict = classifyAttempt({ kind: 'unreachable', code: 'EPERM' }, 1);
+    assert.equal(verdict.code, 'NETWORK_UNAVAILABLE');
+    assert.match(verdict.message, /EPERM/);
+  });
+});
+
+// 一个空闲端口号：先占住再关掉，之后连它就是 ECONNREFUSED
+async function closedPort() {
+  const server = createServer();
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const { port } = server.address();
+  await new Promise((done) => server.close(done));
+  return port;
+}
+
+// 本机 http 服务：读完请求体后按 hangUp 的方式断开（连接确实建立过、请求确实送到了）
+async function withHangingUpServer(hangUp, body) {
+  const server = createServer((req) => {
+    req.resume();
+    req.on('end', () => hangUp(req.socket));
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  try {
+    return await body(`http://127.0.0.1:${server.address().port}`);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+}
+
+const thrown = async (promise) => promise.then(() => assert.fail('expected fetch to fail'), (error) => error);
+
+describe('preConnectFailureCode', () => {
+  for (const [label, make, code] of PRE_CONNECT) {
+    test(`could not connect: ${label} -> ${code}`, () => {
+      assert.equal(preConnectFailureCode(make()), code);
+    });
+  }
+  for (const [label, make] of CONNECTED) {
+    test(`may have reached the server: ${label}`, () => {
+      assert.equal(preConnectFailureCode(make()), null);
+    });
+  }
+
+  // 真跑一次 fetch，只连本机：固定的形状在当前这版 Node 上仍成立。只连 127.0.0.1：
+  // localhost 的 AggregateError 由上面的固定形状钉住，没开 IPv6 的机器会给 ::1 回别的码
+  test('a real fetch to a closed port on this computer could not connect', async () => {
+    const error = await thrown(fetch(`http://127.0.0.1:${await closedPort()}/api/agent/sign-request`, { method: 'POST', body: '{}' }));
+    assert.equal(preConnectFailureCode(error), 'ECONNREFUSED', error.cause?.message);
+  });
+
+  test('a real fetch the server hangs up on after the request may have reached it', async () => {
+    for (const hangUp of [(socket) => socket.destroy(), (socket) => socket.resetAndDestroy()]) {
+      await withHangingUpServer(hangUp, async (base) => {
+        const error = await thrown(fetch(`${base}/api/agent/sign-request`, { method: 'POST', body: '{}' }));
+        assert.ok(error.cause?.code, 'expected a coded cause');
+        assert.equal(preConnectFailureCode(error), null, error.cause.code);
+      });
+    }
   });
 });
 
@@ -616,6 +694,299 @@ describe('runSend: sending', () => {
     assert.equal(code, 1);
     assert.equal(fake.calls.length, 0);
     assert.match(text, /records sends to http:\/\/localhost:3100/);
+  });
+});
+
+describe('runSend: Easy Sign cannot be reached', () => {
+  const [, enotfound] = PRE_CONNECT.find(([, , code]) => code === 'ENOTFOUND');
+  const [, epermEveryAddress] = PRE_CONNECT.find(([label]) => label.includes('every address (EPERM)'));
+  const unreachable = () => {
+    throw enotfound();
+  };
+  const SANDBOX_HINT = /run the same command again outside the sandbox after the user approves/;
+  // 先连上、再在请求之后被重置：本次运行连上过，而且这一次可能已经发出
+  const [, reset] = CONNECTED.find(([label]) => label.includes('(ECONNRESET)'));
+  const resetAfterRequest = () => {
+    throw reset();
+  };
+
+  test('stops at once, says nothing was sent and how to get network access', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const sleeps = [];
+    const fake = fakeFetch([unreachable]);
+    const { code, text } = await send(plan, fake.impl, { sleepImpl: async (ms) => sleeps.push(ms) });
+    assert.equal(code, 1);
+    assert.equal(fake.calls.length, 1);
+    assert.deepEqual(sleeps, []);
+    assert.match(text, /not sent \(NETWORK_UNAVAILABLE: could not connect to Easy Sign \(ENOTFOUND\)\)/);
+    assert.match(text, /Nothing was sent for this row/);
+    assert.match(text, /this computer or sandbox cannot reach Easy Sign/i);
+    assert.match(text, /Codex/);
+    assert.match(text, SANDBOX_HINT);
+    assert.match(text, /Rows already sent will be skipped/);
+    assert.equal(text.includes('may have been sent.'), false);
+    const record = readResults(plan).rows[0];
+    assert.equal(record.status, 'failed');
+    assert.equal(record.error_code, 'NETWORK_UNAVAILABLE');
+  });
+
+  test('stops the whole run: later rows are not tried, and a rerun sends from that row on', async () => {
+    const plan = writePlan({
+      rows: [row(), row({ email: 'sam@example.com', file: pdf('sam.pdf') }), row({ email: 'lee@example.com', file: pdf('lee.pdf') })],
+    });
+    const fake = fakeFetch([
+      response(201, sentBody(1)),
+      () => {
+        throw epermEveryAddress();
+      },
+      response(201, sentBody(3)),
+    ]);
+    const { code, text } = await send(plan, fake.impl);
+    assert.equal(code, 1);
+    assert.equal(fake.calls.length, 2);
+    assert.match(text, /could not connect to Easy Sign \(EPERM\)/);
+    assert.match(text, /Summary: 1 sent now, 0 already sent before, 1 not sent, 0 may have been sent, 1 not tried yet/);
+
+    const after = fakeFetch([response(201, sentBody(2))]);
+    assert.equal((await send(plan, after.impl)).code, 0);
+    assert.deepEqual(after.calls.map((c) => c.body.recipient.email), ['sam@example.com', 'lee@example.com']);
+  });
+
+  // 与上面「立刻停下」不对称：本次运行先连上过一次，之后的连不上只是网络抖了一下，照常退避重试
+  test('after a try that connected, a failed connection is retried with the same key, and a replay settles it', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const sleeps = [];
+    const fake = fakeFetch([resetAfterRequest, unreachable, unreachable, response(201, sentBody(), { 'idempotent-replay': 'true' })]);
+    const { code, text } = await send(plan, fake.impl, { sleepImpl: async (ms) => sleeps.push(ms) });
+    assert.equal(code, 0, text);
+    assert.equal(fake.calls.length, 4);
+    assert.equal(new Set(fake.keys()).size, 1);
+    assert.deepEqual(sleeps, [5000, 10000, 20000]);
+    assert.match(text, /: sent; envelope env-1/);
+  });
+
+  test('after an unclear try, failed connections until the tries run out end as "may have been sent", with the network guidance', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const fake = fakeFetch([resetAfterRequest, unreachable]);
+    const { code, text } = await send(plan, fake.impl);
+    assert.equal(code, 3);
+    assert.equal(fake.calls.length, MAX_ATTEMPTS);
+    assert.equal(text.includes('Nothing was sent'), false);
+    assert.equal(text.includes('not sent ('), false);
+    assert.match(text, /no clear answer from Easy Sign \(NETWORK_UNAVAILABLE: could not connect to Easy Sign \(ENOTFOUND\)\)\. It may have been sent/);
+    assert.match(text, SANDBOX_HINT);
+    const record = readResults(plan).rows[0];
+    assert.equal(record.status, 'unknown');
+    assert.equal(record.error_code, 'NETWORK_UNAVAILABLE');
+  });
+
+  test('after a try that connected but sent nothing, failed connections until the end are not sent, with the network guidance', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const fake = fakeFetch([response(429, { success: false, error: { code: 'RATE_LIMITED' } }, { 'retry-after': '1' }), unreachable]);
+    const { code, text } = await send(plan, fake.impl);
+    assert.equal(code, 1);
+    assert.equal(fake.calls.length, MAX_ATTEMPTS);
+    assert.match(text, /not sent \(NETWORK_UNAVAILABLE: could not connect to Easy Sign \(ENOTFOUND\)\)/);
+    assert.match(text, /Nothing was sent for this row/);
+    assert.match(text, SANDBOX_HINT);
+    assert.equal(/busy/.test(text), false);
+    const record = readResults(plan).rows[0];
+    assert.equal(record.status, 'failed');
+    assert.equal(record.error_code, 'NETWORK_UNAVAILABLE');
+  });
+
+  // 跨运行的同一对：结果文件里先前那次是「没发出去」还是「可能已发出 / 跑到一半被杀」，决定这一次连不上怎么报
+  test('in a later run, a failed connection keeps a row that may have been sent as "may have been sent"', async () => {
+    const plan = writePlan({ rows: [row()] });
+    assert.equal((await send(plan, fakeFetch([failure(400, 'INVALID_FIELD_POSITION')]).impl)).code, 1);
+    const afterRejection = await send(plan, fakeFetch([unreachable]).impl);
+    assert.equal(afterRejection.code, 1);
+    assert.equal(readResults(plan).rows[0].status, 'failed');
+
+    assert.equal((await send(plan, fakeFetch([networkDown]).impl)).code, 3);
+    const unclear = fakeFetch([unreachable]);
+    const afterUnclear = await send(plan, unclear.impl);
+    assert.equal(afterUnclear.code, 3);
+    assert.equal(unclear.calls.length, 1);
+    assert.equal(afterUnclear.text.includes('Nothing was sent'), false);
+    assert.match(afterUnclear.text, /an earlier try got no clear answer/);
+    assert.equal(readResults(plan).rows[0].status, 'unknown');
+  });
+
+  test('a run killed mid-request, then a failed connection, stays "may have been sent"', async () => {
+    const plan = writePlan({ rows: [row()] });
+    await assert.rejects(
+      send(plan, fakeFetch([failure(500, 'INTERNAL_ERROR')]).impl, { sleepImpl: async () => { throw new Error('killed'); } }),
+      /killed/,
+    );
+    assert.equal(readResults(plan).rows[0].status, 'pending');
+    const { code } = await send(plan, fakeFetch([unreachable]).impl);
+    assert.equal(code, 3);
+    assert.equal(readResults(plan).rows[0].status, 'unknown');
+  });
+
+  for (const [label, make] of CONNECTED) {
+    test(`an error after connecting is retried and ends as "may have been sent": ${label}`, async () => {
+      const plan = writePlan({ rows: [row()] });
+      const fake = fakeFetch([
+        () => {
+          throw make();
+        },
+      ]);
+      const { code } = await send(plan, fake.impl);
+      assert.equal(code, 3);
+      assert.equal(fake.calls.length, MAX_ATTEMPTS);
+      assert.equal(readResults(plan).rows[0].status, 'unknown');
+    });
+  }
+
+  test('a real request to a closed port on this computer stops at once as not sent', async () => {
+    const plan = writePlan({ rows: [row()] });
+    let calls = 0;
+    const counted = (url, init) => {
+      calls += 1;
+      return fetch(url, init);
+    };
+    const env = { ...ENV, EASY_SIGN_BASE_URL: `http://127.0.0.1:${await closedPort()}` };
+    const { code, text } = await send(plan, counted, { env });
+    assert.equal(code, 1, text);
+    assert.equal(calls, 1);
+    assert.match(text, /NETWORK_UNAVAILABLE: could not connect to Easy Sign \(ECONNREFUSED\)/);
+  });
+
+  // 结果文件里「可能已发出」且带着 NETWORK_UNAVAILABLE 的记录（由脚本自己在第一次运行里写下）：
+  // 读结果文件的每一处都必须照「可能已发出」对待，不能因为最后一次是连不上就当成没发
+  describe('a row left as "may have been sent" by a lost connection', () => {
+    const start = Date.parse('2026-10-25T12:00:00.000Z');
+    const at = (hours) => () => new Date(start + hours * HOUR);
+
+    async function lostConnection(plan) {
+      const { code } = await send(plan, fakeFetch([resetAfterRequest, unreachable]).impl, { now: at(0) });
+      assert.equal(code, 3);
+      const record = readResults(plan).rows[0];
+      assert.deepEqual([record.status, record.error_code], ['unknown', 'NETWORK_UNAVAILABLE']);
+      return record;
+    }
+
+    test('a rejection in the next run still reports "may have been sent"', async () => {
+      const plan = writePlan({ rows: [row()] });
+      await lostConnection(plan);
+      const { code, text } = await send(plan, fakeFetch([failure(401, 'INVALID_API_KEY', 'API key is invalid')]).impl, { now: at(1) });
+      assert.equal(code, 3);
+      assert.equal(text.includes('Nothing was sent'), false);
+      assert.equal(readResults(plan).rows[0].status, 'unknown');
+    });
+
+    test('the next run keeps the first try\'s time, and refuses after 23 hours', async () => {
+      const plan = writePlan({ rows: [row()] });
+      await lostConnection(plan);
+      assert.equal((await send(plan, fakeFetch([unreachable]).impl, { now: at(UNRESOLVED_RETRY_HOURS - 1) })).code, 3);
+      assert.equal(readResults(plan).rows[0].first_attempt_at, new Date(start).toISOString());
+      const late = fakeFetch([response(201, sentBody())]);
+      const { code, text } = await send(plan, late.impl, { now: at(UNRESOLVED_RETRY_HOURS + 0.1) });
+      assert.equal(code, 1);
+      assert.equal(late.calls.length, 0);
+      assert.match(text, /more than 23 hours ago/);
+    });
+
+    test('refuses it once the row has changed', async () => {
+      const plan = writePlan({ rows: [row()] });
+      await lostConnection(plan);
+      writePlan({ rows: [row({ envelope_name: 'Fixed the name' })] });
+      const fake = fakeFetch([response(201, sentBody())]);
+      const { code, text } = await send(plan, fake.impl, { now: at(1) });
+      assert.equal(code, 1);
+      assert.equal(fake.calls.length, 0);
+      assert.match(text, /row 1 may already have been sent .* has changed since/);
+    });
+
+    test('refuses it with a different API key', async () => {
+      const plan = writePlan({ rows: [row()] });
+      await lostConnection(plan);
+      const fake = fakeFetch([response(201, sentBody())]);
+      const { code, text } = await send(plan, fake.impl, { env: { EASY_SIGN_API_KEY: OTHER_KEY }, now: at(1) });
+      assert.equal(code, 1);
+      assert.equal(fake.calls.length, 0);
+      assert.match(text, /different API key/);
+    });
+
+    test('resolve accepts it, either way', async () => {
+      for (const [i, verdict] of ['--sent', '--not-sent'].entries()) {
+        const plan = writePlan({ rows: [row()] }, `plan-${i}.json`);
+        await lostConnection(plan);
+        assert.equal(await main(['resolve', plan, '--row', '1', verdict], ENV, collector().log), 0, verdict);
+        assert.equal(readResults(plan).rows[0].status, verdict === '--sent' ? 'sent' : 'cleared');
+        rmSync(resultsPathFor(plan));
+      }
+    });
+
+    test('another plan in the folder treats it as possibly sent, for the same and for another document', async () => {
+      const first = writePlan({ rows: [row()] }, 'first.json');
+      await lostConnection(first);
+      const same = writePlan({ rows: [row()] }, 'same.json');
+      const corrected = writePlan({ rows: [row({ file: pdf('jane-corrected.pdf') })] }, 'corrected.json');
+      for (const [plan, pattern] of [[same, /may already have sent jane@example\.com this same document/], [corrected, /may already have sent jane@example\.com a document/]]) {
+        const check = collector();
+        assert.equal(await main(['check', plan], {}, check.log), 1);
+        assert.match(check.lines.join('\n'), pattern);
+        const fake = fakeFetch([response(201, sentBody(2))]);
+        assert.equal((await send(plan, fake.impl, { now: at(1) })).code, 1);
+        assert.equal(fake.calls.length, 0);
+      }
+    });
+  });
+});
+
+describe('runSend: 503 IDEMPOTENCY_UNAVAILABLE', () => {
+  const failureWithRetryAfter = (status, code, message, retryAfter) =>
+    response(status, { success: false, error: { code, message } }, { 'retry-after': retryAfter });
+  // 服务端 app/api/agent/sign-request/route.ts 去重闸那一支的原样回答
+  const unavailable = () => failureWithRetryAfter(503, 'IDEMPOTENCY_UNAVAILABLE', 'Could not reserve the Idempotency-Key, so nothing was sent. Retry with the same key.', '5');
+
+  test('is retried with the same key after Retry-After, and a later 201 is a send', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const sleeps = [];
+    const fake = fakeFetch([unavailable(), response(201, sentBody())]);
+    const { code, text } = await send(plan, fake.impl, { sleepImpl: async (ms) => sleeps.push(ms) });
+    assert.equal(code, 0);
+    assert.deepEqual(sleeps, [5000]);
+    assert.equal(fake.keys()[0], fake.keys()[1]);
+    assert.match(text, /: sent; envelope env-1/);
+  });
+
+  // 不对称的一对：同样是 503，只有带去重闸码的那种能断定「没发出去」
+  test('on every try is reported as Easy Sign being busy, not sent', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const sleeps = [];
+    const fake = fakeFetch([unavailable()]);
+    const { code, text } = await send(plan, fake.impl, { sleepImpl: async (ms) => sleeps.push(ms) });
+    assert.equal(code, 1);
+    assert.equal(fake.calls.length, MAX_ATTEMPTS);
+    assert.equal(new Set(fake.keys()).size, 1);
+    assert.deepEqual(sleeps, Array(MAX_ATTEMPTS - 1).fill(5000));
+    assert.match(text, /not sent \(IDEMPOTENCY_UNAVAILABLE: Easy Sign was busy/);
+    assert.match(text, /Nothing was sent for this row/);
+    assert.match(text, /Stopped\. Easy Sign was busy\. Run the same command again in a few minutes/);
+    assert.equal(readResults(plan).rows[0].status, 'failed');
+  });
+
+  test('any other 503 on every try still ends as "may have been sent"', async () => {
+    for (const [i, other] of [response(503, undefined), failureWithRetryAfter(503, 'SERVICE_UNAVAILABLE', 'down', '5')].entries()) {
+      const plan = writePlan({ rows: [row()] }, `plan-${i}.json`);
+      const { code, text } = await send(plan, fakeFetch([other]).impl);
+      assert.equal(code, 3);
+      assert.equal(text.includes('Nothing was sent'), false);
+      assert.equal(readResults(plan).rows[0].status, 'unknown');
+      rmSync(resultsPathFor(plan));
+    }
+  });
+
+  test('after an unclear try it stays "may have been sent"', async () => {
+    const plan = writePlan({ rows: [row()] });
+    const { code, text } = await send(plan, fakeFetch([networkDown, unavailable()]).impl);
+    assert.equal(code, 3);
+    assert.equal(text.includes('Nothing was sent'), false);
+    assert.equal(readResults(plan).rows[0].status, 'unknown');
   });
 });
 

@@ -12,6 +12,34 @@ export const DEFAULT_BASE_URL = 'https://www.easy-sign.ca';
 const TRANSACTION_ID_REGEX = /^ES-\d{8}-[0-9A-F]{8}$/;
 const REQUEST_TIMEOUT_MS = 60_000;
 
+// 连接建立之前就失败的错误码与阶段。与 easy-sign-send.mjs 的 PRE_CONNECT_CODES 同一份判据，
+// 各抄一份是因为两个 skill 可以分开安装、不能互相 import；测试拿同一组真实形状对拍两边
+export const PRE_CONNECT_CODES = [
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'EPERM',
+  'EACCES',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+];
+export const PRE_CONNECT_SYSCALLS = ['getaddrinfo', 'connect'];
+
+function isPreConnectError(error) {
+  if (!error || typeof error !== 'object') return false;
+  if (Array.isArray(error.errors) && error.errors.length > 0) return error.errors.every(isPreConnectError);
+  if (typeof error.syscall === 'string' && !PRE_CONNECT_SYSCALLS.includes(error.syscall)) return false;
+  return PRE_CONNECT_CODES.includes(error.code);
+}
+
+/** fetch 在建立连接之前就失败了 ⇒ 错误码；否则 null。形状说明见 easy-sign-send.mjs 的同名函数。 */
+export function preConnectFailureCode(error) {
+  const cause = error?.cause;
+  if (!isPreConnectError(cause)) return null;
+  return cause.code ?? cause.errors[0].code;
+}
+
 export function normalizeTransactionId(raw) {
   const id = String(raw ?? '').trim().toUpperCase();
   return TRANSACTION_ID_REGEX.test(id) ? id : null;
@@ -77,6 +105,13 @@ export async function verify({ transactionId, filePath, env, fetchImpl = fetch }
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
+    const unreachable = preConnectFailureCode(error);
+    if (unreachable) {
+      return {
+        ok: false,
+        message: `Could not connect to Easy Sign (${unreachable}): this computer or sandbox cannot reach it, so nothing was checked. In a sandbox without network access (Codex by default), run the same command again outside the sandbox after the user approves.`,
+      };
+    }
     return { ok: false, message: `Could not reach Easy Sign: ${error?.message ?? error}` };
   }
   const json = await response.json().catch(() => null);

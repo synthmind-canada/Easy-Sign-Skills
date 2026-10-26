@@ -1,6 +1,6 @@
 {
   "name": "easy-sign",
-  "description": "Official Easy Sign skills: send PDFs for e-signature and verify signed documents from Claude Code.",
+  "description": "Official Easy Sign skills: send PDFs for e-signature and verify signed documents from Claude Code or Codex.",
   "owner": {
     "name": "Easy Sign",
     "url": "https://www.easy-sign.ca"

@@ -87,5 +87,6 @@ test('every easy-sign command in the skills is one the plugin command accepts, w
     assert.ok(used.length > 0, `${name} shows no easy-sign command`);
     for (const command of used) assert.ok(accepted.has(command), `${name}: easy-sign ${command} is not a command`);
     assert.match(text, /`easy-sign: command not found`/, `${name} must say what to run without the plugin command`);
+    assert.match(text, /`node <this skill's folder>\/scripts\/[\w-]+\.mjs/, `${name} must show the node form Codex runs`);
   }
 });

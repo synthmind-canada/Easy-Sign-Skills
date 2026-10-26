@@ -2,26 +2,45 @@
 name: easy-sign-send
 description: Send PDFs for electronic signature with Easy Sign. Use when the user asks to send a PDF to someone to sign, to request or collect an e-signature by email, or to send each person in a list their own document to sign. Not for one PDF that several people sign together (use the Easy Sign web app). Requires an Easy Sign Pro API key in EASY_SIGN_API_KEY.
 license: MIT
-compatibility: Requires Node.js 20 or later and network access to www.easy-sign.ca.
+compatibility: Works in Claude Code and Codex. Requires Node.js 20 or later and network access to www.easy-sign.ca.
 metadata:
   author: Easy Sign
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # Send PDFs for signature with Easy Sign
 
 Each request emails a real person a link to sign one PDF. A sent email cannot be recalled,
-so this skill always works in the same order: **write a plan, check it, get the user's yes,
-then send exactly that plan.**
+so the work always goes in the same order: **write a plan, check it, get the user's yes,
+then send exactly that plan.** Claude Code and Codex follow the same steps; only the way a
+command is started differs.
 
 One request = one PDF + one signer. To send different PDFs to different people (or the same
 PDF to several people, each signing their own copy), put one row per signer in the plan.
-For one PDF that several people must sign together, tell the user to use the Easy Sign web app instead.
+For one PDF that several people must sign together, tell the user to use the Easy Sign web app.
 
-Run the commands below as written: the Easy Sign plugin puts the `easy-sign` command on the
-path. If the shell answers `easy-sign: command not found` (in Codex, or when this skill was
-installed without the plugin), run `node <this skill's folder>/scripts/easy-sign-send.mjs`
-in its place, with the same arguments.
+## Running the commands
+
+The commands below are written as `easy-sign <command>`:
+
+- **Claude Code** with the Easy Sign plugin: run them as written.
+- **Codex**, or any agent without the plugin: run
+  `node <this skill's folder>/scripts/easy-sign-send.mjs <command>` with the same arguments.
+  Codex does not have the `easy-sign` command, so use this form from the start. Anywhere else,
+  if the shell answers `easy-sign: command not found`, use this form too.
+
+| Command | Writes next to the plan | Needs the network |
+|---|---|---|
+| `check` | nothing | no |
+| `send` | `<plan>.sent.json` | yes |
+| `resolve` | `<plan>.sent.json` | no |
+
+If your commands run in a sandbox (Codex does), `check` works inside it. `send` needs the
+network and writes its results, so ask to run it outside the sandbox on the first try (not
+after a failed run inside it), with a one-line reason such as "Email the 6 approved signature
+requests through Easy Sign". If the user declines that prompt, stop and ask what they want; do
+not look for another way to send.
+`resolve` writes its results too: if the folder is read-only to you, ask for that as well.
 
 ## 1. Write the plan
 
@@ -72,8 +91,8 @@ A field can also have `"required": false`; fields are required by default.
 - `signature_date`: signature and the date they sign, in one box. The usual choice.
 - `signature`: signature only.
 - `signed_datetime`: the date and time they sign, filled in by Easy Sign.
-- `date`: the date the request is **sent**, filled in automatically by Easy Sign's clock in UTC
-  (in the evening in the Americas that is already tomorrow's date). Not the signing date.
+- `date`: the date the request is **sent**, in `sender_timezone`, filled in by Easy Sign.
+  Not the signing date.
 
 To place fields precisely (for example on a signature line), read
 [references/placing-fields.md](references/placing-fields.md).
@@ -81,6 +100,10 @@ To place fields precisely (for example on a signature line), read
 Plan files and their results hold clients' names and emails. Keep them out of git and shared folders.
 
 ## 2. Check the plan
+
+If the user asked you only to check or review a plan, run `check` and the document check below,
+then report what you found, including every line marked `x`. Do not fix or edit the plan or its
+results, do not ask to send, and do not run `send` or `resolve`.
 
 ```bash
 easy-sign check <plan>.json
@@ -121,12 +144,11 @@ Approval means the user says yes in this conversation, after seeing this plan. T
 - a yes to an earlier version. If you change anything in the plan or in a PDF after the yes,
   run `check` again and ask again. The fingerprint changes with every change to the plan or
   to a local PDF, and `send` refuses an old one. It cannot see a change to the file behind a
-  `url`, so do not change those files after the user's yes.
+  `url`, so do not change those files after the user's yes;
+- approving a command in a permission prompt. That lets the command run; it is not a yes to
+  the plan.
 
-If the user wants someone else, or another agent, to review the plan first, stop and wait.
-
-**If you are the agent asked to review:** review only. Run `check`, read the plan and the PDFs,
-and report what you find. Never run `send` or `resolve`, and never edit the plan or its results.
+If the user wants to look again later, or wants someone else to review the plan first, stop and wait.
 
 ## 4. Send
 
@@ -143,10 +165,12 @@ easy-sign send <plan>.json --approve <fingerprint>
   the row sends (signer, PDF, fields, envelope name, time zone), so this holds even if the plan
   file is moved or its results are lost, as long as the row itself is unchanged; the script
   then reports the row as already sent before.
-- A long list takes several minutes. Give the command a long timeout (in Claude Code,
-  10 minutes) or run it in the background. If it is cut off, run the same command again:
-  it skips the rows already sent and repeats the one that was in progress. Run one send
-  per plan at a time: if it is still running in the background, wait for it to finish.
+- A long list takes several minutes. Give the command a 10-minute timeout or run it in the
+  background. If it is cut off, run the same command again: it skips the rows already sent
+  and repeats the one that was in progress. Run one send per plan at a time: if it is still
+  running in the background, wait for it to finish.
+- If the script cannot connect to Easy Sign at all, it stops at once instead of waiting.
+  Run the same command again with network access (in Codex, outside the sandbox).
 - Never edit, move or delete a `.sent.json` file. The script reads all of them in the folder
   to avoid sending someone the same document twice, so keep every plan for a job in one folder.
 - After a row fails, fix that row in the **same** plan file, then check, ask, and send again.
@@ -155,10 +179,6 @@ easy-sign send <plan>.json --approve <fingerprint>
   warn that they were already sent a different document. To remind someone about a document
   already sent, use **Resend** on its envelope in the Easy Sign dashboard: sending it again
   creates a second envelope and a second email.
-
-If a command fails with a network error inside a sandbox (for example Codex), network access
-is turned off. Ask the user to allow it; in Codex that is `network_access = true` under
-`[sandbox_workspace_write]` in `~/.codex/config.toml`.
 
 ## 5. Report back
 
@@ -170,7 +190,7 @@ that its email service accepted the message.
 |---|---|
 | sent now | Sent by this run. Give the envelope ID. |
 | already sent before | Sent by an earlier run. Nothing new was emailed. |
-| not sent | Easy Sign refused it. Give the reason. |
+| not sent | Nothing was sent for this row. Give the reason. |
 | may have been sent | No clear answer. Do not send this row any other way: not with a new plan, not from the web app. See "A row that may have been sent" below. |
 | not tried yet | The script stopped before this row. |
 
@@ -197,25 +217,7 @@ easy-sign resolve <plan>.json --row 4 --not-sent  # there is none
 Run `resolve` only with the user's answer. After `--not-sent`, the next `send` sends that row
 as a new request.
 
-## When something goes wrong
+## When a command fails
 
-| What the script says | What to do |
-|---|---|
-| `EASY_SIGN_API_KEY is not set` | Ask the user to create a key in Easy Sign (Settings > API Keys, Pro plan), add it to their shell profile, and start you again from a new terminal. |
-| `sender_timezone is missing` | Ask the user for their time zone, add it to the plan, check again. |
-| `changed since it was approved` | The plan or a PDF changed after the user said yes. Run `check`, tell the user what changed, and ask again. |
-| `already sent this same document` | That person already has this document from another plan. Remove the row, or use Resend in the dashboard to remind them. |
-| `was already sent ... and has changed since` | That row already went out. Put it back as it was; for a corrected version, write a new plan with just that row. |
-| `may already have been sent` | See "A row that may have been sent". |
-| `another send or resolve of this plan holds` the lock | Wait for the other run to finish. Delete the `.lock` file only after the user confirms that no send of this plan is running anywhere. |
-| `cannot be read` (a `.sent.json` file) | Do not delete it. Show the user the file and the error. |
-| `PRO_REQUIRED`, `QUOTA_EXCEEDED` | The API needs an active Easy Sign Pro plan. |
-| `KEY_REVOKED`, `KEY_EXPIRED` | The key no longer works. Keys are also revoked automatically when Pro ends: ask the user to check their plan, then create a new key. |
-| `INVALID_API_KEY` | Check that `EASY_SIGN_API_KEY` holds the whole key. If the same key worked earlier today, Easy Sign may have had a short outage: try once more in a few minutes before asking for a new key. |
-| `SAME_EMAIL` | The signer's email is the user's own account email; the API cannot send to it. |
-| `DOCUMENT_TOO_MANY_PAGES`, `DOCUMENT_TOO_LARGE`, `INVALID_PDF`, `INVALID_FIELD_POSITION` | Fix that row (every page number must exist in the PDF; a `url` must be served as a PDF), then check, ask, and send again. |
-| `DOCUMENT_URL_FAILED`, `INVALID_URL` | The link must lead straight to the PDF: https, no redirects, answering within 10 seconds. If the file is under 3 MB, download it and use `file` instead. |
-| `STORAGE_EXCEEDED` | The user's Easy Sign storage is full. |
-| `EMAIL_FAILED` | Easy Sign could not email that address and removed the envelope. Check the address with the user. |
-| `Easy Sign was busy` | Nothing was sent for that row. Run the same command again in a few minutes. |
-| `no clear answer from Easy Sign` (exit code 3) | The row may have been sent. See "A row that may have been sent". |
+The script's last lines say whether anything was sent and what to do next; follow them.
+For what each error code means, read [references/troubleshooting.md](references/troubleshooting.md).

@@ -56,12 +56,30 @@ export const ACCOUNT_ERROR_CODES = [
   'QUOTA_EXCEEDED',
   'STORAGE_EXCEEDED',
 ];
-// 服务端在任何副作用之前就拒掉的暂时性故障：重试用完仍是它们 = 确定没发出去
-const BUSY_ERROR_CODES = ['RATE_LIMITED', 'DATABASE_ERROR'];
+// 服务端在建信封、发信之前就拒掉的暂时性故障：重试用完仍是它们 = 确定没发出去
+const BUSY_ERROR_CODES = ['RATE_LIMITED', 'DATABASE_ERROR', 'IDEMPOTENCY_UNAVAILABLE'];
+// 这一次尝试连不上 Easy Sign（见 preConnectFailureCode）：这一次确定没发出去
+const NETWORK_UNAVAILABLE = 'NETWORK_UNAVAILABLE';
 // 结果文件里「可能已经发出去、还没有定论」的两种状态
 const UNRESOLVED = ['pending', 'unknown'];
-// 429 的 Retry-After 上限：服务端窗口是 60 秒，超过这个数说明头不可信
+// Retry-After 的上限：限流窗口是 60 秒、去重闸故障给 5 秒，超过这个数说明头不可信
 const MAX_RETRY_AFTER_SECONDS = 120;
+
+// 连接建立之前就失败的错误码：DNS 解析不了、连接被拒、沙箱禁止联网、路由不通、建连超时。
+// 此时请求的一个字节都没有发出去。连接建立之后的错误（ECONNRESET、对端关闭、超时、TLS、
+// 认不出的码、没有码）不在此列：服务端可能已经收到并发出了邮件
+export const PRE_CONNECT_CODES = [
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'EPERM',
+  'EACCES',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+];
+// 带 syscall 的错误只认解析与建连两步：同一个码出在 read / write 上，说明连接已经建立过
+export const PRE_CONNECT_SYSCALLS = ['getaddrinfo', 'connect'];
 
 function sha256(text) {
   return createHash('sha256').update(text).digest('hex');
@@ -416,6 +434,25 @@ export function apiKeyFingerprint(apiKey) {
 // 发送：单次请求 + 结果分类
 // ---------------------------------------------------------------------------
 
+function isPreConnectError(error) {
+  if (!error || typeof error !== 'object') return false;
+  // 一个主机名解析出几个地址时 Node 逐个去连，全失败才抛 AggregateError：每一个都得是建连前失败
+  if (Array.isArray(error.errors) && error.errors.length > 0) return error.errors.every(isPreConnectError);
+  if (typeof error.syscall === 'string' && !PRE_CONNECT_SYSCALLS.includes(error.syscall)) return false;
+  return PRE_CONNECT_CODES.includes(error.code);
+}
+
+/**
+ * fetch 是不是在建立连接之前就失败了：是 ⇒ 返回错误码（服务端一定没收到这次请求），否 ⇒ null。
+ * Node 抛的是 TypeError('fetch failed')，原因在 cause 上：带 code 的 Error，或多地址时的
+ * AggregateError（code 在它自己和 errors[] 每一项上）。认不出的形状一律 null，按「可能已发出」处理。
+ */
+export function preConnectFailureCode(error) {
+  const cause = error?.cause;
+  if (!isPreConnectError(cause)) return null;
+  return cause.code ?? cause.errors[0].code;
+}
+
 async function postOnce({ baseUrl, apiKey, idempotencyKey, body, fetchImpl }) {
   try {
     const response = await fetchImpl(`${baseUrl}${ENDPOINT}`, {
@@ -437,6 +474,8 @@ async function postOnce({ baseUrl, apiKey, idempotencyKey, body, fetchImpl }) {
       json,
     };
   } catch (error) {
+    const unreachable = preConnectFailureCode(error);
+    if (unreachable) return { kind: 'unreachable', code: unreachable };
     return { kind: 'network', message: error?.name === 'TimeoutError' ? 'timed out' : String(error?.message ?? error) };
   }
 }
@@ -445,10 +484,19 @@ async function postOnce({ baseUrl, apiKey, idempotencyKey, body, fetchImpl }) {
  * 把一次尝试的结果分成三类。
  * - sent：201，信封已建、邮件已发（或回放了先前那次）
  * - retry：用同一个键再试一次是安全的。uncertain = 这一次可能已经在服务端发出了邮件
- *   （网络错误 / 读不出的 201 / 409 / 5xx）；429 与 401 DATABASE_ERROR 出在任何副作用之前，不算
- * - fail：服务端在建信封、发信之前拒绝了这个请求（EMAIL_FAILED 例外：它在回滚之后返回）
+ *   （连上之后的网络错误 / 读不出的 201 / 409 / 5xx）；429、401 DATABASE_ERROR 与
+ *   503 IDEMPOTENCY_UNAVAILABLE 出在建信封、发信之前，不算；连不上的那一次也不算
+ * - fail：服务端在建信封、发信之前拒绝了这个请求（EMAIL_FAILED 例外：它在回滚之后返回），
+ *   或者这一行在本次运行里一次都没连上（NETWORK_UNAVAILABLE：这台电脑 / 沙箱到不了 Easy Sign，重试只是空等）
+ * connectedBefore = 这一行在本次运行里先前有一次尝试连上过（拿到过回答，或连上之后才出错）：
+ * 那时连不上多半是网络抖了一下，照常退避重试，同一个键常能拿回先前那次的回放
  */
-export function classifyAttempt(attempt, attemptNumber) {
+export function classifyAttempt(attempt, attemptNumber, { connectedBefore = false } = {}) {
+  if (attempt.kind === 'unreachable') {
+    const message = `could not connect to Easy Sign (${attempt.code})`;
+    if (!connectedBefore) return { outcome: 'fail', code: NETWORK_UNAVAILABLE, message };
+    return { outcome: 'retry', uncertain: false, code: NETWORK_UNAVAILABLE, delaySeconds: backoffSeconds(attemptNumber), reason: message };
+  }
   if (attempt.kind === 'network') {
     return { outcome: 'retry', uncertain: true, delaySeconds: backoffSeconds(attemptNumber), reason: attempt.message };
   }
@@ -460,10 +508,12 @@ export function classifyAttempt(attempt, attemptNumber) {
     return { outcome: 'retry', uncertain: true, delaySeconds: backoffSeconds(attemptNumber), reason: 'unreadable response' };
   }
   if (attempt.status === 429) {
-    const wait = Number.isFinite(attempt.retryAfter) && attempt.retryAfter > 0
-      ? Math.min(attempt.retryAfter, MAX_RETRY_AFTER_SECONDS)
-      : 60;
-    return { outcome: 'retry', uncertain: false, code: 'RATE_LIMITED', delaySeconds: wait, reason: 'rate limited' };
+    return { outcome: 'retry', uncertain: false, code: 'RATE_LIMITED', delaySeconds: retryAfterSeconds(attempt, 60), reason: 'rate limited' };
+  }
+  // 去重闸暂时不可用：服务端在建信封、发信之前返回，说明里写明「nothing was sent」（去重行可能已经
+  // 写进去，之后同一个键会答 409，那一支照旧算「可能已发出」）。只认 503 + 这个码，别的 5xx 照旧算「可能已发出」
+  if (attempt.status === 503 && code === 'IDEMPOTENCY_UNAVAILABLE') {
+    return { outcome: 'retry', uncertain: false, code, delaySeconds: retryAfterSeconds(attempt, backoffSeconds(attemptNumber)), reason: 'temporary server error' };
   }
   // 这个接口的 409 只有一种含义：同一个键的上一次请求还没结束，而它可能已经发出了邮件。
   // 读不出错误码时也按这个处理 —— 当成「请求有误、没发」就是一句可能为假的「没发」
@@ -492,6 +542,12 @@ function backoffSeconds(attemptNumber) {
   return Math.min(5 * 2 ** (attemptNumber - 1), 60);
 }
 
+function retryAfterSeconds(attempt, fallback) {
+  return Number.isFinite(attempt.retryAfter) && attempt.retryAfter > 0
+    ? Math.min(attempt.retryAfter, MAX_RETRY_AFTER_SECONDS)
+    : fallback;
+}
+
 /** 只挑能安全留存的字段：signing_url 是签署人的凭证，永远不进输出与结果文件。 */
 function safeSentRecord(json) {
   return {
@@ -507,14 +563,17 @@ function safeSentRecord(json) {
  * 发一行，最多 MAX_ATTEMPTS 次。uncertain 由调用方带入（这一行先前的运行没有定论），
  * 本次运行里出现过可能已发信的尝试也会置位；置位之后，任何「拒绝」都只能报 unknown ——
  * 先前那次可能已经发出，后面这次被拒（例如 key 刚被吊销）证明不了「没发」。
+ * 连不上（NETWORK_UNAVAILABLE）同理：它只证明这一次没发出去，不证明先前那次。
  */
 export async function sendRow({ row, idempotencyKey, senderTimezone, baseUrl, apiKey, fetchImpl, sleepImpl, log, uncertain = false }) {
   const body = buildRequestBody(row, senderTimezone);
   let maybeSent = uncertain;
+  let connected = false;
   let lastVerdict = null;
   for (let attemptNumber = 1; attemptNumber <= MAX_ATTEMPTS; attemptNumber += 1) {
     const attempt = await postOnce({ baseUrl, apiKey, idempotencyKey, body, fetchImpl });
-    const verdict = classifyAttempt(attempt, attemptNumber);
+    const verdict = classifyAttempt(attempt, attemptNumber, { connectedBefore: connected });
+    connected ||= attempt.kind !== 'unreachable';
     if (verdict.outcome === 'sent') {
       // 第一次就拿到回放 = 先前的运行发出的；本次后续尝试拿到的回放 = 本次前面那次发出的
       return { status: 'sent', sent_before: attempt.replayed && attemptNumber === 1, ...safeSentRecord(attempt.json) };
@@ -531,11 +590,15 @@ export async function sendRow({ row, idempotencyKey, senderTimezone, baseUrl, ap
       await sleepImpl(verdict.delaySeconds * 1000);
     }
   }
+  // 最后一次连不上：带上 NETWORK_UNAVAILABLE，输出才会给出联网的指引而不是「Easy Sign 忙」
+  const unreachableAtEnd = lastVerdict.code === NETWORK_UNAVAILABLE;
   if (!maybeSent) {
-    // 每一次都在副作用之前被挡（限流 / 暂时故障）：确定没发出去
-    return { status: 'failed', error_code: lastVerdict.code, error_message: `Easy Sign was busy (${lastVerdict.reason})` };
+    // 每一次都在建信封、发信之前被挡（限流 / 暂时故障 / 连不上）：确定没发出去
+    return unreachableAtEnd
+      ? { status: 'failed', error_code: NETWORK_UNAVAILABLE, error_message: lastVerdict.reason }
+      : { status: 'failed', error_code: lastVerdict.code, error_message: `Easy Sign was busy (${lastVerdict.reason})` };
   }
-  return { status: 'unknown', error_message: lastVerdict.reason };
+  return { status: 'unknown', ...(unreachableAtEnd ? { error_code: NETWORK_UNAVAILABLE } : {}), error_message: lastVerdict.reason };
 }
 
 // ---------------------------------------------------------------------------
@@ -879,6 +942,9 @@ async function sendRows({ planPath, result, resultsPath, baseUrl, apiKey, keyFin
       if (outcome.error_code === 'EMAIL_FAILED') {
         log('      Easy Sign could not email this address and removed the envelope.');
         log('Stopped. Check the address with the user, fix it in the same plan file, run check again and get their approval; rows already sent will be skipped.');
+      } else if (outcome.error_code === NETWORK_UNAVAILABLE) {
+        log('      Nothing was sent for this row.');
+        log('Stopped. This computer or sandbox cannot reach Easy Sign right now, so the remaining rows were not tried. In a sandbox without network access (Codex by default), run the same command again outside the sandbox after the user approves. Otherwise check the internet connection and run it again. Rows already sent will be skipped.');
       } else if (BUSY_ERROR_CODES.includes(outcome.error_code)) {
         log('      Nothing was sent for this row.');
         log('Stopped. Easy Sign was busy. Run the same command again in a few minutes; rows already sent will be skipped.');
@@ -893,6 +959,10 @@ async function sendRows({ planPath, result, resultsPath, baseUrl, apiKey, keyFin
     } else {
       counts.maybeSent += 1;
       log(`${label}: no clear answer from Easy Sign (${outcome.error_code ? `${outcome.error_code}: ` : ''}${outcome.error_message}). It may have been sent.`);
+      if (outcome.error_code === NETWORK_UNAVAILABLE) {
+        // 只说这一次连不上；绝不说「没发出去」：先前那次可能已经发出
+        log('      The last try could not connect: this computer or sandbox cannot reach Easy Sign. In a sandbox without network access (Codex by default), run the same command again outside the sandbox after the user approves; otherwise check the internet connection.');
+      }
       log('Stopped. Do not send this row any other way. Run the same command again later: it repeats this exact request, which Easy Sign recognizes for 24 hours after the first try, so it will not email them twice. If it keeps ending like this, ask the user to check the Easy Sign dashboard and use "resolve".');
       exitCode = 3;
     }
