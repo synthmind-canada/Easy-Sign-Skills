@@ -118,9 +118,9 @@ outside the sandbox. Choose **Yes, proceed** when it is the send you just approv
 (the command ends with the plan's fingerprint) or the document check you asked for. That prompt only lets the command run; your yes
 to the plan is the one you give in the chat.
 
-If you run Codex without approval prompts, it cannot ask. Let it write in your folder and
-reach the network in `~/.codex/config.toml`, then start Codex again. This applies to every Codex
-session, not just Easy Sign. Put the first line above any `[section]` in that file:
+If you run Codex without approval prompts, it cannot ask. Give it a profile that can write in
+your folder and reach the network, and use that profile only for Easy Sign. Create
+`~/.codex/easy-sign.config.toml`:
 
 ```toml
 sandbox_mode = "workspace-write"
@@ -128,6 +128,9 @@ sandbox_mode = "workspace-write"
 [sandbox_workspace_write]
 network_access = true
 ```
+
+Then start Codex with `codex --profile easy-sign`. Codex sessions started without the profile
+keep their usual sandbox. (Tested with Codex 0.162.1.)
 
 ## Privacy
 
